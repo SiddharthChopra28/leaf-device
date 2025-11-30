@@ -37,14 +37,17 @@ class _HomePageState extends State<HomePage> {
   BluetoothConnection? _connection;
   String? _connectedName;
   StreamSubscription<List<int>>? _inputSub;
-  final List<_ChatMessage> _messages = [];
-  final TextEditingController _textController = TextEditingController();
+  // Last reading received from the device
+  String? _lastReading;
+  // Whether a reading request is in progress
+  bool _isTakingReading = false;
+  // Completer used to await a single response from the device
+  Completer<String>? _pendingReadCompleter;
 
   @override
   void dispose() {
     _inputSub?.cancel();
     _connection?.dispose();
-    _textController.dispose();
     super.dispose();
   }
 
@@ -53,12 +56,20 @@ class _HomePageState extends State<HomePage> {
     _inputSub = connection.input?.listen(
       (data) {
         final text = utf8.decode(data);
-        if (mounted) {
-          setState(() {
-            _messages.add(
-              _ChatMessage(sender: MessageSender.device, text: text),
-            );
-          });
+        // Split incoming stream by lines and handle them individually.
+        final parts = text.split(RegExp(r"\r?\n"));
+        for (final part in parts) {
+          final trimmed = part.trim();
+          if (trimmed.isEmpty) continue;
+          // If there is a pending read completer, complete it with the first incoming non-empty line.
+          if (_pendingReadCompleter != null && !_pendingReadCompleter!.isCompleted) {
+            _pendingReadCompleter!.complete(trimmed);
+          } else {
+            // Otherwise update last reading so user can still see unsolicited values.
+            if (mounted) {
+              setState(() => _lastReading = trimmed);
+            }
+          }
         }
       },
       onError: (e) {
@@ -85,21 +96,27 @@ class _HomePageState extends State<HomePage> {
     }
   }
 
-  Future<void> _sendMessage() async {
-    final text = _textController.text.trim();
-    if (text.isEmpty || _connection == null || !_connection!.isConnected)
-      return;
+  Future<void> _takeReading() async {
+    if (_connection == null || !_connection!.isConnected) return;
+    if (_isTakingReading) return;
+    setState(() {
+      _isTakingReading = true;
+      _lastReading = null;
+    });
+
+    _pendingReadCompleter = Completer<String>();
     try {
-      _connection!.writeString(text + '\n');
-      setState(() {
-        _messages.add(_ChatMessage(sender: MessageSender.me, text: text));
-        _textController.clear();
-      });
+      // Send a simple text command the Arduino expects. Adjust `READ` to match your sketch.
+      _connection!.writeString('READ\n');
+      final response = await _pendingReadCompleter!.future
+          .timeout(const Duration(seconds: 6));
+      if (mounted) setState(() => _lastReading = response.trim());
     } catch (e) {
-      if (kDebugMode) print('Write error: $e');
-      ScaffoldMessenger.maybeOf(
-        context,
-      )?.showSnackBar(const SnackBar(content: Text('Failed to send.')));
+      if (kDebugMode) print('Reading failed: $e');
+      if (mounted) setState(() => _lastReading = 'Error or timeout');
+    } finally {
+      _pendingReadCompleter = null;
+      if (mounted) setState(() => _isTakingReading = false);
     }
   }
 
@@ -132,7 +149,7 @@ class _HomePageState extends State<HomePage> {
             ),
         ],
       ),
-      body: isConnected ? _buildChat() : _buildDisconnected(),
+      body: isConnected ? _buildReadingScreen() : _buildDisconnected(),
       floatingActionButton: isConnected
           ? null
           : FloatingActionButton.extended(
@@ -165,63 +182,60 @@ class _HomePageState extends State<HomePage> {
     );
   }
 
-  Widget _buildChat() {
+  Widget _buildReadingScreen() {
     return Column(
       children: [
         Expanded(
-          child: ListView.builder(
-            padding: const EdgeInsets.all(12),
-            itemCount: _messages.length,
-            itemBuilder: (context, index) {
-              final m = _messages[index];
-              final align = m.sender == MessageSender.me
-                  ? Alignment.centerRight
-                  : Alignment.centerLeft;
-              final color = m.sender == MessageSender.me
-                  ? Colors.blue[200]
-                  : Colors.grey[300];
-              return Align(
-                alignment: align,
-                child: Container(
-                  margin: const EdgeInsets.symmetric(vertical: 4),
-                  padding: const EdgeInsets.symmetric(
-                    vertical: 8,
-                    horizontal: 12,
+          child: Center(
+            child: Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 24.0),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  const Icon(Icons.speed, size: 72, color: Colors.green),
+                  const SizedBox(height: 16),
+                  Text(
+                    _lastReading != null ? 'Reading:' : 'No reading yet',
+                    textAlign: TextAlign.center,
+                    style: const TextStyle(fontSize: 18),
                   ),
-                  decoration: BoxDecoration(
-                    color: color,
-                    borderRadius: BorderRadius.circular(12),
-                  ),
-                  child: Text(m.text),
-                ),
-              );
-            },
+                  if (_lastReading != null) ...[
+                    const SizedBox(height: 12),
+                    SelectableText(
+                      _lastReading!,
+                      textAlign: TextAlign.center,
+                      style: const TextStyle(fontSize: 22, fontWeight: FontWeight.bold),
+                    ),
+                  ],
+                ],
+              ),
+            ),
           ),
         ),
         SafeArea(
-          child: Row(
-            children: [
-              Expanded(
-                child: Padding(
-                  padding: const EdgeInsets.all(8.0),
-                  child: TextField(
-                    controller: _textController,
-                    decoration: const InputDecoration(
-                      border: OutlineInputBorder(),
-                      hintText: 'Type a message…',
-                    ),
-                    onSubmitted: (_) => _sendMessage(),
+          child: Padding(
+            padding: const EdgeInsets.all(16.0),
+            child: Row(
+              children: [
+                Expanded(
+                  child: ElevatedButton.icon(
+                    icon: _isTakingReading
+                        ? const SizedBox(width: 16, height: 16, child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white))
+                        : const Icon(Icons.play_arrow),
+                    label: Text(_isTakingReading ? 'Taking…' : 'Take Reading'),
+                    onPressed: _isTakingReading ? null : _takeReading,
                   ),
                 ),
-              ),
-              Padding(
-                padding: const EdgeInsets.only(right: 8.0),
-                child: IconButton(
-                  icon: const Icon(Icons.send),
-                  onPressed: _sendMessage,
+                const SizedBox(width: 12),
+                ElevatedButton.icon(
+                  icon: const Icon(Icons.refresh),
+                  label: const Text('Clear'),
+                  onPressed: () {
+                    setState(() => _lastReading = null);
+                  },
                 ),
-              ),
-            ],
+              ],
+            ),
           ),
         ),
       ],
